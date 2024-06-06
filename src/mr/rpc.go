@@ -8,22 +8,51 @@ package mr
 
 import "os"
 import "strconv"
-
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
+import "fmt"
 
 // Add your RPC definitions here.
+type TaskType uint32
 
+const (
+    TASK_TYPE_MAP           = 0
+    TASK_TYPE_REDUCE        = 1
+    TASK_TYPE_TERMINATED    = 2
+)
+
+type ArgsFetchTask struct {
+}
+
+type ReplyFetchTask struct {
+    Type        TaskType
+    NReduce     int
+    InputFiles  []string
+    TaskId      int
+}
+
+type RPCError struct {
+    Code        int
+    Reason      string
+}
+
+func (e *RPCError) Error() string {
+    return fmt.Sprintf("RPC error, %d, %s", e.Code, e.Reason)
+}
+
+type TaskOutput struct {
+    Code        int
+    Reason      string
+    File        string
+}
+
+type ArgsReportTask struct {
+    Id          int
+    Err         RPCError
+    Output      []TaskOutput
+}
+
+type ReplyReportTask struct {
+    Type TaskType
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
