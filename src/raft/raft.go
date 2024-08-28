@@ -32,7 +32,7 @@ import (
 const DEBUG = false
 
 func (this *Raft) debug(format string, args ...interface{}) {
-	if DEBUG {
+	if (DEBUG) {
         var leader string
         if (this.votedFor == this.me) {
             leader = "*"
@@ -49,18 +49,17 @@ const (
     /* retry cnt when VOTE rpc failed caused by network issues */
     RPC_RETRY_VOTE              = 1
     /* retry cnt when APPEND rpc failed caused by network issues */
-    RPC_RETRY_APPEND            = 5
+    RPC_RETRY_APPEND            = 10
     /* retry cnt when SNAPSHOT rpc failed caused by network issues */
-    RPC_RETRY_SNAPSHOT          = 2
+    RPC_RETRY_SNAPSHOT          = 3
     /* rpc timeout */
-    RPC_TIMEOUT_MS              = 30
+    RPC_TIMEOUT_MS              = 20
     /* leader send heartbeat rpc every HEARTBEAT_TICK_MS ms */
-    HEARTBEAT_TICK_MS           = 50
+    HEARTBEAT_TICK_MS           = 100
     /*
      * FOLLOWER timeout if it has not got heartbeat rpc in
      * HEARTBEAT_TIMEOUT_MS_BASE + rand(HEARTBEAT_TIMEOUT_MS_DELTA) ms
      */
-    //HEARTBEAT_TIMEOUT_MS_BASE   = 150
     HEARTBEAT_TIMEOUT_MS_BASE   = 200
     HEARTBEAT_TIMEOUT_MS_DELTA  = 300
 )
@@ -83,6 +82,35 @@ type ApplyMsg struct {
 	Snapshot            []byte
 	SnapshotTerm        int
 	SnapshotIndex       int
+}
+
+type CommitChannel struct {
+    lock                sync.RWMutex
+    closed              bool
+    ch                  chan ApplyMsg
+}
+
+func (this *CommitChannel) init(ch chan ApplyMsg) {
+    this.lock = sync.RWMutex{}
+    this.closed = false
+    this.ch = ch
+}
+
+func (this *CommitChannel) final() {
+    this.lock.Lock()
+    defer this.lock.Unlock()
+    this.closed = true
+    close(this.ch)
+}
+
+func (this *CommitChannel) send(msg ApplyMsg) {
+    this.lock.RLock()
+    defer this.lock.RUnlock()
+
+    if (this.closed) {
+        return
+    }
+    this.ch <- msg
 }
 
 type Entry struct {
@@ -109,11 +137,13 @@ type Raft struct {
     matchIndex          map[int]int     /* index of highest log entry known to be replicated to each server */
 
     /* implementing properties */
-    applyCh             chan ApplyMsg
+    commitCh            CommitChannel
     broadcaster         Broadcaster
     snapshot            []byte
     snapshotTerm        int
     snapshotIndex       int
+
+    flushNoti           FlushNotify
 }
 
 type RequestVoteArgs struct {
@@ -171,6 +201,7 @@ type AsyncRequest struct {
     body                interface{}
     replyCh             *chan AsyncReply
     chRef               *int32
+    done                *int32
 }
 
 type AsyncReply struct {
@@ -188,10 +219,56 @@ type Broadcaster struct {
     active              bool
 }
 
+type FlushNotify struct {
+    ch                  chan bool
+    lock                sync.RWMutex
+    active              bool
+}
+
+func (this *FlushNotify) init() {
+    this.ch = make(chan bool, 1)
+    this.lock = sync.RWMutex{}
+    this.active = true
+}
+
+func (this *FlushNotify) final() {
+    this.lock.Lock()
+    defer this.lock.Unlock()
+
+    close(this.ch)
+    this.active = false
+}
+
+func (this *FlushNotify) notify() {
+    this.lock.RLock()
+    defer this.lock.RUnlock()
+
+    if (!this.active) {
+        return
+    }
+    select {
+    case this.ch <- true:
+    case <-time.After(time.Duration(1) * time.Millisecond):
+    }
+    return
+}
+
+func (this *FlushNotify) wait(millisecond uint64) {
+    this.lock.RLock()
+    defer this.lock.RUnlock()
+
+    if (!this.active) {
+        return
+    }
+    select {
+    case <-time.After(time.Duration(millisecond) * time.Millisecond):
+    case <-this.ch:
+    }
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (this *Raft) GetState() (term int, isLeader bool) {
-	// Your code here (3A).
     this.mu.Lock()
     term = this.currentTerm
     isLeader = this.votedFor == this.me
@@ -280,6 +357,9 @@ end:
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (this *Raft) Snapshot(index int, snapshot []byte) {
+    this.mu.Lock()
+    defer this.mu.Unlock()
+
     if (this.snapshotIndex >= index) {
         return
     }
@@ -325,22 +405,29 @@ func (this *Raft) getLogBy(term int, index int) (entry *Entry, entryIndex int) {
 
 func (this *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
     this.mu.Lock()
-    defer this.mu.Unlock()
-
     /* leadership checking */
     if (this.currentTerm > args.Term) {
         this.debug("append denied\n")
         reply.Term = this.currentTerm
         reply.Success = false
+        this.mu.Unlock()
         return
     }
+    /* re-called request checking */
+    if (this.currentTerm == args.Term && this.commitIndex > args.LeaderCommit) {
+        reply.Term = this.currentTerm
+        reply.Success = true
+        this.mu.Unlock()
+        return
+    }
+    /* a leader has been chosen by MAJORITY when append is called */
     if (this.votedFor != args.LeaderId || this.currentTerm != args.Term) {
-        /* a leader has been chosen by MAJORITY when append is called */
         this.votedFor = args.LeaderId
         this.currentTerm = args.Term
         this.persist()
     }
     reply.Term = args.Term
+    commitEntries := []Entry{}
     /* log matching */
     e, truncateIdx := this.getLogBy(args.PrevLogTerm, args.PrevLogIndex)
     isMatch := e != nil || (this.snapshotIndex == args.PrevLogIndex && this.snapshotTerm == args.PrevLogTerm)
@@ -356,9 +443,9 @@ func (this *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRep
         this.commitIndex = args.LeaderCommit
         /* apply log */
         if (args.LeaderCommit == args.PrevLogIndex) {
-            /* leader has commited all logs */
-            this.debug("follower commit logs\n")
-            this.apply(this.currentTerm, this.commitIndex)
+            /* leader has replicated all logs */
+            commitEntries = append(commitEntries, this.prepareCommitEntries(this.currentTerm, this.commitIndex)...)
+            this.debug("follower commit logs: %v\n", commitEntries)
         }
         this.persist()
         reply.Success = true
@@ -385,6 +472,11 @@ func (this *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRep
                reply.Term, reply.Success, reply.RetryIndex, reply.RetryTerm,
                this.snapshotTerm, this.snapshotIndex,
                this.log)
+    this.mu.Unlock()
+
+    if (reply.Success && args.LeaderCommit == args.PrevLogIndex) {
+        this.commit(args.Term, commitEntries)
+    }
 }
 
 func (this *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -516,7 +608,7 @@ func (this *Raft) Start(command interface{}) (index int, term int, success bool)
     this.log = append(this.log, entry)
     this.persist()
     success = true
-
+    this.flushNoti.notify()
     this.debug("---- START called ----- command: %v\n" +
                "====> this.log: %v\n" +
                "\n",
@@ -544,43 +636,45 @@ func (this *Raft) getLogsBetween(startIdx int, endIdx int) (entries []Entry) {
 }
 
 func (this *Raft) applySnapshot() {
+    if (this.killed()) {
+        return
+    }
     if (len(this.snapshot) == 0) {
         return
     }
-    this.applyCh <- ApplyMsg {
+    this.commitCh.send(ApplyMsg {
         CommandValid        : false,
         SnapshotValid       : true,
         Snapshot            : this.snapshot,
         SnapshotTerm        : this.snapshotTerm,
         SnapshotIndex       : this.snapshotIndex,
-    }
+    })
     this.lastApplied = this.snapshotIndex
     this.debug("apply snapshot, snapshot term: %v, index: %v\n", this.snapshotTerm, this.snapshotIndex)
 }
 
-func (this *Raft) apply(curTerm int, commitIndex int) {
-    entries := this.getLogsBetween(this.lastApplied, commitIndex)[1:]
+func (this *Raft) commit(curTerm int, entries []Entry) {
     if (len(entries) == 0) {
         return
     }
     if (entries[len(entries) - 1].Term != curTerm) {
-        this.debug("skipping commit of logs from previous term: %v\n", entries)
         return
     }
     for _, entry := range(entries) {
-        msg := ApplyMsg {
+        if (this.killed()) {
+            break
+        }
+        this.commitCh.send(ApplyMsg {
             CommandValid        : true,
             Command             : entry.Val,
             CommandIndex        : entry.Index,
             SnapshotValid       : false,
-        }
-        this.applyCh <- msg
+        })
     }
-    this.lastApplied = commitIndex
-    this.debug("commit logs: %v\n", entries)
+    return
 }
 
-func (this *Raft) requestVoteFrom(server int, term int, replyCh *chan AsyncReply, chRef *int32) {
+func (this *Raft) requestVoteFrom(server int, term int, replyCh *chan AsyncReply, chRef *int32, done *int32) {
     entries := this.getLogsBetween(this.commitIndex, this.commitIndex)
     args := RequestVoteArgs {
         Term            : term,
@@ -599,6 +693,7 @@ func (this *Raft) requestVoteFrom(server int, term int, replyCh *chan AsyncReply
             body            : args,
             replyCh         : replyCh,
             chRef           : chRef,
+            done            : done,
     })
     return
 }
@@ -607,12 +702,13 @@ func (this *Raft) elect(term int) (elected bool, newTerm int) {
     broadcastCnt := len(this.peers) - 1
     replyCh := make(chan AsyncReply, broadcastCnt)
     chRef := int32(broadcastCnt)
+    done := int32(0)
     sendCnt := 0
     for server, _ := range(this.peers) {
         if (server == this.me) {
             continue
         }
-        this.requestVoteFrom(server, term, &replyCh, &chRef)
+        this.requestVoteFrom(server, term, &replyCh, &chRef, &done)
         sendCnt++
     }
     granted := 1
@@ -634,10 +730,12 @@ func (this *Raft) elect(term int) (elected bool, newTerm int) {
     if (elected) {
         newTerm = term
     }
+    atomic.StoreInt32(&done, 1)
     return
 }
 
-func (this *Raft) replicateTo(server int, term int, startIdx int, endIdx int, replyCh *chan AsyncReply, chRef *int32) {
+func (this *Raft) replicateTo(server int, term int, startIdx int, endIdx int,
+                              replyCh *chan AsyncReply, chRef *int32, done *int32) {
     entries := this.getLogsBetween(startIdx, endIdx)
     args := AppendEntriesArgs {
         Term            : term,
@@ -654,6 +752,7 @@ func (this *Raft) replicateTo(server int, term int, startIdx int, endIdx int, re
         body            : args,
         replyCh         : replyCh,
         chRef           : chRef,
+        done            : done,
     })
     return
 }
@@ -675,6 +774,7 @@ func (this *Raft) installSnapshotTo(server int, curTerm int) (success bool, newT
     }
     replyCh := make(chan AsyncReply, 1)
     chRef := int32(1)
+    done := int32(0)
     this.broadcaster.send(server, AsyncRequest {
         server              : server,
         requestType         : REQUEST_SNAPSHOT,
@@ -682,8 +782,10 @@ func (this *Raft) installSnapshotTo(server int, curTerm int) (success bool, newT
         body                : args,
         replyCh             : &replyCh,
         chRef               : &chRef,
+        done                : &done,
     })
     reply := <- replyCh
+    atomic.StoreInt32(&done, 1)
     if (!reply.success) {
         success = false
         newTerm = -1
@@ -699,12 +801,17 @@ func (this *Raft) replicate(term int, index int) (success bool) {
     broadcastCnt := len(this.peers) - 1
     replyCh := make(chan AsyncReply, broadcastCnt)
     chRef := int32(broadcastCnt)
+    done := int32(0)
     sendCnt := 0
+    flush := false
     for server, _ := range(this.peers) {
         if (server == this.me) {
             continue
         }
-        this.replicateTo(server, term, this.nextIndex[server], index, &replyCh, &chRef)
+        if (this.nextIndex[server] != index) {
+            flush = true
+        }
+        this.replicateTo(server, term, this.nextIndex[server], index, &replyCh, &chRef, &done)
         sendCnt++
     }
     granted := 1
@@ -716,8 +823,13 @@ func (this *Raft) replicate(term int, index int) (success bool) {
         }
         body := reply.body.(AppendEntriesReply)
         if (body.Success) {
+            this.matchIndex[reply.server] = this.nextIndex[reply.server]
             this.nextIndex[reply.server] = index
             granted++
+            if (granted == majority) {
+                break
+            }
+
         } else {
             if (body.Term == term) {
                 retryIndex := this.snapshotIndex
@@ -729,7 +841,7 @@ func (this *Raft) replicate(term int, index int) (success bool) {
                 }
                 /* install snapshot */
                 if (retryIndex == this.snapshotIndex && len(this.snapshot) > 0) {
-                    this.debug("install snapshot to %v\n", reply.server)
+                    this.debug("install snapshot to %v, index: %v\n", reply.server, retryIndex)
                     snapshoted, newTerm := this.installSnapshotTo(reply.server, term)
                     if (!snapshoted) {
                         if (newTerm > term) {
@@ -743,8 +855,7 @@ func (this *Raft) replicate(term int, index int) (success bool) {
                     }
                 }
                 this.debug("retry replicate to %v, with previous index %v, this.snapshotIndex: %v\n", reply.server, retryIndex, this.snapshotIndex)
-                this.nextIndex[reply.server] = retryIndex
-                this.replicateTo(reply.server, term, this.nextIndex[reply.server], index, &replyCh, &chRef)
+                this.replicateTo(reply.server, term, retryIndex, index, &replyCh, &chRef, &done)
                 sendCnt++
                 continue
             } else {
@@ -755,6 +866,10 @@ func (this *Raft) replicate(term int, index int) (success bool) {
         }
     }
     success = granted >= majority
+    if (success && flush) {
+        this.flushNoti.notify()
+    }
+    atomic.StoreInt32(&done, 1)
     this.debug("==== replicate logs of term: %v, index: %v done, success: %v\n", term, index, success)
     return
 }
@@ -769,9 +884,14 @@ func (this *Raft) replicate(term int, index int) (success bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (this *Raft) Kill() {
+    this.mu.Lock()
+    defer this.mu.Unlock()
     this.debug("killing, this.log: %v\n", this.log)
+
 	atomic.StoreInt32(&this.dead, 1)
+    this.flushNoti.final()
     this.broadcaster.final()
+    this.commitCh.final()
 }
 
 func (rf *Raft) killed() bool {
@@ -822,6 +942,35 @@ func (this *Raft) startTerm() (success bool, term int) {
     return
 }
 
+func (this *Raft) isMajorityReplicated(index int) (replicated bool) {
+    /* commit logs after majoiry of followers have committed */
+    matched := 0
+    for server, _ := range(this.peers) {
+        /* matchIndex[i] indicates the committed log index of peer[i] */
+        if (server == this.me) {
+            continue
+        }
+        if (this.matchIndex[server] == index) {
+            matched++
+        }
+    }
+    replicated = matched >= len(this.peers) / 2
+    return
+}
+
+func (this *Raft) prepareCommitEntries(curTerm int, index int) (entries []Entry) {
+    if (this.lastApplied > index) {
+        fmt.Printf("this.lastApplied: %v, index: %v, this.snapshotIndex: %v\n",
+                    this.lastApplied, index, this.snapshotIndex)
+        panic("unexpected state\n")
+    }
+    entries = this.getLogsBetween(this.lastApplied, index)[1:]
+    if (len(entries) > 0 && entries[len(entries) - 1].Term == curTerm) {
+        this.lastApplied = index
+    }
+    return
+}
+
 func (this *Raft) heartbeat() {
     this.debug("heartbeat started\n")
     for !this.killed() {
@@ -838,10 +987,18 @@ func (this *Raft) heartbeat() {
             this.mu.Unlock()
             break
         }
-        this.apply(term, index)
-        this.mu.Unlock()
+        /* commit logs after majoiry of followers have committed */
+        replicated := this.isMajorityReplicated(index)
+        if (replicated) {
+            commitEntries := this.prepareCommitEntries(term, index)
+            this.debug("leader commit logs: %v\n", commitEntries)
+            this.mu.Unlock()
+            this.commit(term, commitEntries)
+        } else {
+            this.mu.Unlock()
+        }
         /* hearbeat broadcast happens every 100ms */
-        time.Sleep(time.Duration(HEARTBEAT_TICK_MS) * time.Millisecond)
+        this.flushNoti.wait(HEARTBEAT_TICK_MS)
     }
     this.debug("heartbeat terminated\n")
 }
@@ -869,6 +1026,12 @@ func (this *Raft) ticker() {
 func handleRequest(request *AsyncRequest, rf *Raft) (reply AsyncReply) {
     reply.server = request.server
     for i := 0; i < request.retryCnt; i++ {
+        if (rf.killed()) {
+            break
+        }
+        if (atomic.LoadInt32(request.done) == 1) {
+            break
+        }
         var task string
         switch (request.requestType) {
         case REQUEST_VOTE:
@@ -904,19 +1067,24 @@ func handleRequest(request *AsyncRequest, rf *Raft) (reply AsyncReply) {
 func handleBroadcastTo(server int, rf *Raft, requestCh chan AsyncRequest) {
     rf.debug("[broadcast] handler of %v start\n", server)
     for request := range(requestCh) {
+        if (rf.killed()) {
+            break
+        }
         reply := handleRequest(&request, rf)
         if (!reply.success) {
             rf.debug("[broadcast] request to %v failed due to network issues\n", server)
         }
         (*request.replyCh) <- reply
+
+        retry := false
         if (request.requestType == REQUEST_APPEND && reply.success) {
             /* retry case */
             body := reply.body.(AppendEntriesReply)
             if (!body.Success && body.Term == request.body.(AppendEntriesArgs).Term) {
-                continue
+                retry = true
             }
         }
-        if (atomic.AddInt32(request.chRef, -1) == 0) {
+        if (!retry && atomic.AddInt32(request.chRef, -1) == 0) {
             close(*request.replyCh)
         }
     }
@@ -988,13 +1156,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
         nextIndex           : make(map[int]int),
         matchIndex          : make(map[int]int),
         /* implementing properties */
-        applyCh             : applyCh,
         broadcaster         : Broadcaster{},
         snapshot            : []byte{},
         snapshotTerm        : 1,
         snapshotIndex       : 0,
     }
+    rf.commitCh.init(applyCh)
     rf.broadcaster.init(rf)
+    rf.flushNoti.init()
 
 	// initialize from state persisted before a crash
 	err := rf.readPersist(persister.ReadRaftState())
