@@ -17,6 +17,8 @@ package shardctrler
 // You will need to add fields to the RPC argument structs.
 //
 
+const DEBUG = false
+
 // The number of shards.
 const NShards = 10
 
@@ -29,45 +31,51 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+    OK                  = "OK"
+    RETRY               = "retry"
+    CONFIG_NOT_FIND     = "config is not find"
 )
 
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+    ClerkId         int64
+    ClerkSerial     uint64
+	Servers         map[int][]string // new GID -> servers mappings
 }
 
 type JoinReply struct {
-	WrongLeader bool
 	Err         Err
 }
 
 type LeaveArgs struct {
-	GIDs []int
+    ClerkId         int64
+    ClerkSerial     uint64
+	GIDs            []int
 }
 
 type LeaveReply struct {
-	WrongLeader bool
 	Err         Err
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+    ClerkId         int64
+    ClerkSerial     uint64
+	Shard           int
+	GID             int
 }
 
 type MoveReply struct {
-	WrongLeader bool
 	Err         Err
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+    ClerkId         int64
+    ClerkSerial     uint64
+	Num             int // desired config number
 }
 
 type QueryReply struct {
-	WrongLeader bool
 	Err         Err
 	Config      Config
 }
