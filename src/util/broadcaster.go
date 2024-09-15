@@ -8,12 +8,6 @@ import "reflect"
 import "fmt"
 import "sync"
 
-const (
-    OK                  = "OK"
-    RETRY               = "retry"
-    CONFIG_NOT_FIND     = "config is not find"
-)
-
 type Broadcaster struct {
     typeMapping     map[string](reflect.Type)
 }
@@ -25,9 +19,9 @@ func (this *Broadcaster) Init() {
 func (this *Broadcaster) RegisterPair(args interface{}, reply interface{}) {
     argsT := reflect.TypeOf(args)
     replyT := reflect.TypeOf(reply)
-    _, hasErr := replyT.FieldByName("Err")
+    _, hasErr := replyT.FieldByName("RaftErr")
     if (!hasErr) {
-        fmt.Printf("reply type %v has no 'Err' field\n", replyT.Name())
+        fmt.Printf("reply type %v has no 'RaftErr' field\n", replyT.Name())
         panic("unable to register request pair\n")
     }
     this.typeMapping[argsT.Name()] = replyT
@@ -52,7 +46,7 @@ func (this *Broadcaster) sendRequest(server *labrpc.ClientEnd, api string,
     if (!success) {
         return
     }
-    errV := reflect.Indirect(replyV).FieldByName("Err")
+    errV := reflect.Indirect(replyV).FieldByName("RaftErr")
     success = errV.String() == OK
     return
 }

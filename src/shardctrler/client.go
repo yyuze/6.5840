@@ -30,7 +30,7 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-    ck.broadcaster = util.Broadcaster {}
+    ck.broadcaster = util.Broadcaster{}
     ck.id = nrand()
     ck.serial = uint64(0)
 

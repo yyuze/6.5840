@@ -39,7 +39,7 @@ type JoinArgs struct {
 }
 
 type JoinReply struct {
-	Err         Err
+	RaftErr         Err
 }
 
 type LeaveArgs struct {
@@ -49,7 +49,7 @@ type LeaveArgs struct {
 }
 
 type LeaveReply struct {
-	Err         Err
+	RaftErr         Err
 }
 
 type MoveArgs struct {
@@ -60,7 +60,7 @@ type MoveArgs struct {
 }
 
 type MoveReply struct {
-	Err         Err
+	RaftErr         Err
 }
 
 type QueryArgs struct {
@@ -70,6 +70,6 @@ type QueryArgs struct {
 }
 
 type QueryReply struct {
-	Err         Err
+	RaftErr         Err
 	Config      Config
 }
