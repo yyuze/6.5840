@@ -3,6 +3,8 @@ package shardctrler
 import "6.5840/raft"
 import "6.5840/labrpc"
 import "6.5840/labgob"
+import "6.5840/util"
+
 import "sync"
 import "sync/atomic"
 import "fmt"
@@ -39,7 +41,6 @@ const (
 )
 
 type OpResult struct {
-    success             bool
     body                interface{}
 }
 
@@ -93,11 +94,11 @@ func (this *ShardCtrler) raftReplicate(clerkId int64, clerkSerial uint64,
     /* wait result with timeout */
     select {
     case opResult := <- resultCh:
-        success = opResult.success
         result = opResult.body
+        success = true
     case <-time.After(time.Duration(2 * raft.HEARTBEAT_TICK_MS) * time.Millisecond):
-        success = false
         this.debug("start op timeout, term: %v, index: %v\n", term, index)
+        success = false
     }
     this.mu.Lock()
     close(resultCh)
@@ -110,9 +111,9 @@ func (this *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
     success, result := this.raftReplicate(args.ClerkId, args.ClerkSerial, OP_JOIN, *args)
     if (success) {
         *reply = result.(JoinReply)
-        reply.Err = OK
+        reply.Err = util.OK
     } else {
-        reply.Err = RETRY
+        reply.Err = util.RETRY
     }
     return
 }
@@ -121,9 +122,9 @@ func (this *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
     success, result := this.raftReplicate(args.ClerkId, args.ClerkSerial, OP_LEAVE, *args)
     if (success) {
         *reply = result.(LeaveReply)
-        reply.Err = OK
+        reply.Err = util.OK
     } else {
-        reply.Err = RETRY
+        reply.Err = util.RETRY
     }
 }
 
@@ -131,9 +132,9 @@ func (this *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
     success, result := this.raftReplicate(args.ClerkId, args.ClerkSerial, OP_MOVE, *args)
     if (success) {
         *reply = result.(MoveReply)
-        reply.Err = OK
+        reply.Err = util.OK
     } else {
-        reply.Err = RETRY
+        reply.Err = util.RETRY
     }
 }
 
@@ -141,9 +142,9 @@ func (this *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
     success, result := this.raftReplicate(args.ClerkId, args.ClerkSerial, OP_QUERY, *args)
     if (success) {
         *reply = result.(QueryReply)
-        reply.Err = OK
+        reply.Err = util.OK
     } else {
-        reply.Err = RETRY
+        reply.Err = util.RETRY
     }
 }
 
@@ -260,7 +261,7 @@ func (this *ShardCtrler) doJoin(args JoinArgs) (reply JoinReply) {
     }
     balanceShards(&config)
     this.configs = append(this.configs, config)
-    reply = JoinReply{ Err : OK }
+    reply = JoinReply{ Err : util.OK }
     return
 }
 
@@ -271,7 +272,7 @@ func (this *ShardCtrler) doLeave(args LeaveArgs) (reply LeaveReply) {
     }
     balanceShards(&config)
     this.configs = append(this.configs, config)
-    reply = LeaveReply{ Err : OK }
+    reply = LeaveReply{ Err : util.OK }
     return
 }
 
@@ -279,14 +280,14 @@ func (this *ShardCtrler) doMove(args MoveArgs) (reply MoveReply) {
     config := this.newConfig()
     config.Shards[args.Shard] = args.GID
     this.configs = append(this.configs, config)
-    reply = MoveReply{ Err : OK }
+    reply = MoveReply{ Err : util.OK }
     return
 }
 
 func (this *ShardCtrler) doQuery(args QueryArgs) (reply QueryReply) {
     if (args.Num < 0 || args.Num >= len(this.configs)) {
         reply = QueryReply {
-            Err         : OK,
+            Err         : util.OK,
             Config      : this.configs[len(this.configs) - 1],
         }
         return
@@ -294,7 +295,7 @@ func (this *ShardCtrler) doQuery(args QueryArgs) (reply QueryReply) {
     for _, config := range(this.configs) {
         if (config.Num == args.Num) {
             reply = QueryReply {
-                Err         : OK,
+                Err         : util.OK,
                 Config      : config,
             }
             break
@@ -309,23 +310,25 @@ func (this *ShardCtrler) handleRaftCommand(index int, command interface{}) {
 
     this.mu.Lock()
     result := OpResult{}
-    if (!this.opProcessed(op)) {
-        switch (op.Type) {
-        case OP_JOIN:
+    processed := this.opProcessed(op)
+    switch (op.Type) {
+    case OP_JOIN:
+        if (!processed) {
             result.body = this.doJoin(op.Body.(JoinArgs))
-        case OP_LEAVE:
-            result.body = this.doLeave(op.Body.(LeaveArgs))
-        case OP_MOVE:
-            result.body = this.doMove(op.Body.(MoveArgs))
-        case OP_QUERY:
-            result.body = this.doQuery(op.Body.(QueryArgs))
-        default:
-            fmt.Printf("op.Type: %v\n", op.Type)
-            panic("unknown operation type\n")
         }
-        result.success = true
-    } else {
-        result.success = false
+    case OP_LEAVE:
+        if (!processed) {
+            result.body = this.doLeave(op.Body.(LeaveArgs))
+        }
+    case OP_MOVE:
+        if (!processed) {
+            result.body = this.doMove(op.Body.(MoveArgs))
+        }
+    case OP_QUERY:
+        result.body = this.doQuery(op.Body.(QueryArgs))
+    default:
+        fmt.Printf("op.Type: %v\n", op.Type)
+        panic("unknown operation type\n")
     }
     /* wakeup waiting */
     if (op.StartServer == this.me) {

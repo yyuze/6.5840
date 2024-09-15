@@ -30,12 +30,6 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
-const (
-    OK                  = "OK"
-    RETRY               = "retry"
-    CONFIG_NOT_FIND     = "config is not find"
-)
-
 type Err string
 
 type JoinArgs struct {
