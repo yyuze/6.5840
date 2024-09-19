@@ -141,6 +141,7 @@ func TestRejection5A(t *testing.T) {
 					// if v is "", it probably means that a k/v group
 					// returned a value for a key even though that
 					// key's shard wasn't assigned to to the group.
+                    fmt.Printf("v: %v, va[i]: %v\n", v, va[i])
 					ch <- fmt.Sprintf("Get(%v): returned a value, but server should have rejected the request due to wrong shard", ka[i])
 				} else {
 					ch <- fmt.Sprintf("Get(%v): expected:\n%v\nreceived:\n%v", ka[i], va[i], v)

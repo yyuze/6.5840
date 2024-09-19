@@ -30,6 +30,25 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (this *Config) Equal(config Config) bool {
+    return this.Num == config.Num
+}
+
+func (this *Config) MakeCopy() (c Config) {
+    c = Config{
+        Num         : this.Num,
+        Shards      : [NShards]int{},
+        Groups      : make(map[int][]string),
+    }
+    for idx, shard := range(this.Shards) {
+        c.Shards[idx] = shard
+    }
+    for gid, servers := range(this.Groups) {
+        c.Groups[gid] = servers
+    }
+    return
+}
+
 type Err string
 
 type JoinArgs struct {

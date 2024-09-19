@@ -168,7 +168,7 @@ func balanceShards(config *Config) {
     }
 }
 
-func (this *ShardCtrler) doJoin(data interface{}) (reply interface{}) {
+func (this *ShardCtrler) doJoin(raftIndex int, data interface{}) (reply interface{}) {
     args := data.(JoinArgs)
     config := this.newConfig()
     for gid, servers := range(args.Servers) {
@@ -180,7 +180,7 @@ func (this *ShardCtrler) doJoin(data interface{}) (reply interface{}) {
     return
 }
 
-func (this *ShardCtrler) doLeave(data interface{}) (reply interface{}) {
+func (this *ShardCtrler) doLeave(raftIndex int, data interface{}) (reply interface{}) {
     args := data.(LeaveArgs)
     config := this.newConfig()
     for _, gid := range(args.GIDs) {
@@ -192,7 +192,7 @@ func (this *ShardCtrler) doLeave(data interface{}) (reply interface{}) {
     return
 }
 
-func (this *ShardCtrler) doMove(data interface{}) (reply interface{}) {
+func (this *ShardCtrler) doMove(raftIndex int, data interface{}) (reply interface{}) {
     args := data.(MoveArgs)
     config := this.newConfig()
     config.Shards[args.Shard] = args.GID
@@ -201,7 +201,7 @@ func (this *ShardCtrler) doMove(data interface{}) (reply interface{}) {
     return
 }
 
-func (this *ShardCtrler) doQuery(data interface{}) (reply interface{}) {
+func (this *ShardCtrler) doQuery(raftIndex int, data interface{}) (reply interface{}) {
     args := data.(QueryArgs)
     if (args.Num < 0 || args.Num >= len(this.configs)) {
         reply = QueryReply {

@@ -1,50 +1,279 @@
 package shardkv
 
-
+import "6.5840/labgob"
 import "6.5840/labrpc"
 import "6.5840/raft"
+import "6.5840/shardctrler"
+import "6.5840/util"
+
 import "sync"
-import "6.5840/labgob"
+import "sync/atomic"
+import "sort"
+import "bytes"
+import "fmt"
+import "time"
 
+type Version struct {
+    RaftIndex           int
+    ClerkId             int64
+    Seq                 uint64
+    Data                string
+}
 
+type Versions []Version
 
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+func (arr Versions) Len() int {
+    return len(arr)
+}
+
+func (arr Versions) Swap(i int, j int) {
+    temp := arr[j]
+    arr[j] = arr[i]
+    arr[i] = temp
+}
+
+func (arr Versions) Less(i int, j int) bool {
+    return arr[i].RaftIndex < arr[j].RaftIndex
+}
+
+type Value struct {
+    mutates             map[int64]([]Version)                   /* clerkId -> Version */
+}
+
+func (this *Value) getVal() (value string) {
+    versions := []Version{}
+    for _, vers := range(this.mutates) {
+        versions = append(versions, vers...)
+    }
+    sort.Sort(Versions(versions))
+    value = ""
+    for _, version := range(versions) {
+        value += version.Data
+    }
+    return
+}
+
+func (this *Value) putVal(raftIndex int, clerkId int64, seq uint64, value string) (success bool) {
+    old, contains := this.mutates[clerkId]
+    if (contains && old[len(old) - 1].Seq >= seq) {
+        success = false
+        return
+    }
+    this.mutates[clerkId] = []Version {
+        Version {
+            RaftIndex   : raftIndex,
+            ClerkId     : clerkId,
+            Seq         : seq,
+            Data        : value,
+        },
+    }
+    success = true
+    return
+}
+
+func (this *Value) appendVal(raftIndex int, clerkId int64, seq uint64, value string) (success bool) {
+    old, contains := this.mutates[clerkId]
+    if (!contains) {
+        this.putVal(raftIndex, clerkId, seq, value)
+        success = true
+        return
+    }
+    if (old[len(old) - 1].Seq >= seq) {
+        success = false
+        return
+    }
+    this.mutates[clerkId] = append(old, Version {
+        RaftIndex   : raftIndex,
+        ClerkId     : clerkId,
+        Seq         : seq,
+        Data        : value,
+    })
+    success = true
+    return
 }
 
 type ShardKV struct {
-	mu           sync.Mutex
-	me           int
-	rf           *raft.Raft
-	applyCh      chan raft.ApplyMsg
-	make_end     func(string) *labrpc.ClientEnd
-	gid          int
-	ctrlers      []*labrpc.ClientEnd
-	maxraftstate int // snapshot if log grows this big
+    terminated          int32
+    mu                  sync.Mutex
+    me                  int
+    seq                 uint64
+    rf                  *raft.Raft
+    make_end            func(string) *labrpc.ClientEnd
+    gid                 int
 
-	// Your definitions here.
+    sm                  *shardctrler.Clerk                  /* sharder manager */
+    config              shardctrler.Config
+    fsm                 util.RaftFSM
+    data                map[string]Value                    /* key -> value */
 }
 
+const (
+    OP_GET              = 0
+    OP_PUT_APPEND       = 1
+    OP_UPDATE_CONFIG      = 2
+)
 
-func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+type UpdateConfigArgs struct {
+    LeaderConfig        shardctrler.Config
 }
 
-func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+type UpdateConfigReply struct {
+}
+
+func (this *ShardKV) hasKey(key string) bool {
+    shard := key2shard(key)
+    return this.config.Shards[shard] == this.gid
+}
+
+func (this *ShardKV) refreshConfig() {
+    this.mu.Lock()
+    defer this.mu.Unlock()
+
+    config := this.sm.Query(-1)
+    if (this.config.Equal(config)) {
+        return
+    }
+    args := UpdateConfigArgs {
+        LeaderConfig        : config.MakeCopy(),
+    }
+    this.fsm.Submit(int64(this.me), atomic.AddUint64(&this.seq, 1), OP_UPDATE_CONFIG, args)
+}
+
+func (this *ShardKV) updateConfig() {
+    for !this.killed() {
+        time.Sleep(100 * time.Millisecond)
+        this.refreshConfig()
+    }
+}
+
+//func (this *ShardKV) fetchShard() {
+//
+//}
+
+func (this *ShardKV) Get(args *GetArgs, reply *GetReply) {
+    this.mu.Lock()
+    defer this.mu.Unlock()
+
+    if (!this.hasKey(args.Key)) {
+        reply.RaftErr = util.OK
+        reply.Err = ErrWrongGroup
+        return
+    }
+    success, result := this.fsm.Submit(args.ClerkId, args.ClerkSerial, OP_GET, *args)
+    if (success) {
+        *reply = result.(GetReply)
+        reply.RaftErr = util.OK
+    } else {
+        reply.RaftErr = util.RETRY
+    }
+}
+
+func (this *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+    this.mu.Lock()
+    defer this.mu.Unlock()
+
+    if (!this.hasKey(args.Key)) {
+        reply.RaftErr = util.OK
+        reply.Err = ErrWrongGroup
+        return
+    }
+    success, result := this.fsm.Submit(args.ClerkId, args.ClerkSerial, OP_PUT_APPEND, *args)
+    if (success) {
+        *reply = result.(PutAppendReply)
+        reply.RaftErr = util.OK
+    } else {
+        reply.RaftErr = util.RETRY
+    }
 }
 
 // the tester calls Kill() when a ShardKV instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
-func (kv *ShardKV) Kill() {
-	kv.rf.Kill()
-	// Your code here, if desired.
+func (this *ShardKV) Kill() {
+    atomic.StoreInt32(&this.terminated, 1)
+	this.fsm.Kill()
 }
 
+func (this *ShardKV) killed() bool {
+    return atomic.LoadInt32(&this.terminated) == 1
+}
+
+func (this *ShardKV) doGet(raftIndex int, data interface{}) (reply interface{}) {
+    args := data.(GetArgs)
+    value, contains := this.data[args.Key]
+    if (!contains) {
+        reply = GetReply {
+            Err         : ErrNoKey,
+            Value       : "",
+        }
+        return
+    }
+    reply = GetReply {
+        Err         : OK,
+        Value       : value.getVal(),
+    }
+    return
+}
+
+func (this *ShardKV) doPutAppend(raftIndex int, data interface{}) (reply interface{}) {
+    args := data.(PutAppendArgs)
+    switch (args.Op) {
+    case "Put":
+        value, contains := this.data[args.Key]
+        if (!contains) {
+            value = Value { mutates : make(map[int64]([]Version)) }
+            this.data[args.Key] = value
+        }
+        value.putVal(raftIndex, args.ClerkId, args.ClerkSerial, args.Value)
+    case "Append":
+        value, contains := this.data[args.Key]
+        if (!contains) {
+            value = Value { mutates : make(map[int64]([]Version)) }
+            this.data[args.Key] = value
+        }
+        value.appendVal(raftIndex, args.ClerkId, args.ClerkSerial, args.Value)
+    default:
+        fmt.Printf("op: %v\n", args.Op)
+        panic("invalid put-append op\n")
+    }
+    reply = PutAppendReply { Err : OK }
+    return
+}
+
+func (this *ShardKV) doUpdateConfig(raftIndex int, data interface{}) (reply interface{}) {
+    args := data.(UpdateConfigArgs)
+    this.config = args.LeaderConfig
+    return UpdateConfigReply{}
+}
+
+type Snapshot struct {
+    Data            map[string]Value
+}
+
+func (this *ShardKV) snapshotSerializer() (snapshotBytes []byte) {
+    buf := bytes.Buffer{}
+    enc := labgob.NewEncoder(&buf)
+    snapshot := Snapshot {
+        Data    : this.data,
+    }
+    enc.Encode(&snapshot)
+    snapshotBytes = buf.Bytes()
+    return
+}
+
+func (this *ShardKV) snapshotDeserializer(snapshotBytes []byte) {
+    buf := bytes.NewBuffer(snapshotBytes)
+    dec := labgob.NewDecoder(buf)
+    snapshot := Snapshot{}
+    err := dec.Decode(&snapshot)
+    if (err != nil) {
+        fmt.Printf("error: %v\n", err)
+        panic("decode shardkv snapshot failed\n")
+    }
+    this.data = snapshot.Data
+    return
+}
 
 // servers[] contains the ports of the servers in this group.
 //
@@ -72,26 +301,46 @@ func (kv *ShardKV) Kill() {
 //
 // StartServer() must return quickly, so it should start goroutines
 // for any long-running work.
-func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
+func StartServer(servers []*labrpc.ClientEnd,
+                 me int,
+                 persister *raft.Persister,
+                 maxraftstate int,
+                 gid int,
+                 ctrlers []*labrpc.ClientEnd,
+                 make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(PutAppendArgs{})
+	labgob.Register(PutAppendReply{})
+	labgob.Register(GetArgs{})
+	labgob.Register(GetReply{})
+	labgob.Register(UpdateConfigArgs{})
+	labgob.Register(UpdateConfigReply{})
 
-	kv := new(ShardKV)
-	kv.me = me
-	kv.maxraftstate = maxraftstate
-	kv.make_end = make_end
-	kv.gid = gid
-	kv.ctrlers = ctrlers
+    kv := ShardKV {
+        terminated          : int32(0),
+        mu                  : sync.Mutex{},
+        me                  : me,
+        seq                 : uint64(0),
+        rf                  : nil,
+        make_end            : make_end,
+        gid                 : gid,
+        sm                  : shardctrler.MakeClerk(ctrlers),
+        fsm                 : util.RaftFSM{},
+        data                : make(map[string]Value),
+    }
 
-	// Your initialization code here.
+    kv.fsm.Init(me, servers, persister, maxraftstate)
+    kv.fsm.RegisterHandler(OP_GET, true, kv.doGet)
+    kv.fsm.RegisterHandler(OP_PUT_APPEND, false, kv.doPutAppend)
+    kv.fsm.RegisterHandler(OP_UPDATE_CONFIG, false, kv.doUpdateConfig)
+    kv.fsm.RegisterSnapshotHandler(kv.snapshotSerializer, kv.snapshotDeserializer)
+    kv.fsm.Start()
 
-	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+    kv.rf = kv.fsm.Raft()
+    kv.refreshConfig()
 
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+    go kv.updateConfig()
 
-
-	return kv
+	return &kv
 }

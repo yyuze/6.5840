@@ -9,36 +9,38 @@ package shardkv
 // You will have to modify these definitions.
 //
 
+const DEBUG = true
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
 )
 
 type Err string
 
 // Put or Append
 type PutAppendArgs struct {
-	// You'll have to add definitions here.
-	Key   string
-	Value string
-	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+    ClerkId         int64
+    ClerkSerial     uint64
+    Key             string
+    Value           string
+    Op              string // "Put" or "Append"
 }
 
 type PutAppendReply struct {
-	Err Err
+    RaftErr         string
+	Err             Err
 }
 
 type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
+    ClerkId         int64
+    ClerkSerial     uint64
+    Key             string
 }
 
 type GetReply struct {
-	Err   Err
-	Value string
+    RaftErr         string
+	Err             Err
+	Value           string
 }

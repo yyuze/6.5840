@@ -9,10 +9,25 @@ package shardkv
 //
 
 import "6.5840/labrpc"
+import "6.5840/shardctrler"
+import "6.5840/util"
+import "6.5840/raft"
+
 import "crypto/rand"
 import "math/big"
-import "6.5840/shardctrler"
 import "time"
+import "fmt"
+import "sync"
+import "sync/atomic"
+import "log"
+
+func (this *Clerk) debug(format string, a ...interface{}) {
+	if DEBUG {
+        prefix := fmt.Sprintf("[kvclerk %v] ", this.id)
+		log.Printf(prefix + format, a...)
+	}
+	return
+}
 
 // which shard is a key in?
 // please use this function,
@@ -34,10 +49,14 @@ func nrand() int64 {
 }
 
 type Clerk struct {
-	sm       *shardctrler.Clerk
-	config   shardctrler.Config
-	make_end func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
+    sm              *shardctrler.Clerk
+    config          shardctrler.Config
+    configMu        sync.Mutex
+    make_end        func(string) *labrpc.ClientEnd
+    // You will have to modify this struct.
+    id              int64
+    serial          uint64
+    broadcaster     util.Broadcaster
 }
 
 // the tester calls MakeClerk.
@@ -48,82 +67,124 @@ type Clerk struct {
 // Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs.
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
-	ck := new(Clerk)
-	ck.sm = shardctrler.MakeClerk(ctrlers)
-	ck.make_end = make_end
-	// You'll have to add code here.
-	return ck
+    ck := Clerk {
+        sm              : shardctrler.MakeClerk(ctrlers),
+        make_end        : make_end,
+        id              : nrand(),
+        serial          : uint64(0),
+        broadcaster     : util.Broadcaster{},
+    }
+
+    ck.broadcaster.Init()
+    ck.broadcaster.RegisterPair(PutAppendArgs{}, PutAppendReply{})
+    ck.broadcaster.RegisterPair(GetArgs{}, GetReply{})
+
+	return &ck
+}
+
+func (this *Clerk) getServersContainsKey(key string) (servers [](*labrpc.ClientEnd)) {
+    this.configMu.Lock()
+    defer this.configMu.Unlock()
+
+    for {
+        gid := this.config.Shards[key2shard(key)]
+        serverNames, contains := this.config.Groups[gid]
+        if (contains) {
+            servers = [](*labrpc.ClientEnd){}
+            for _, name := range(serverNames) {
+                servers = append(servers, this.make_end(name))
+            }
+            break
+        } else {
+            time.Sleep(raft.HEARTBEAT_TIMEOUT_MS_BASE * time.Millisecond)
+            this.config = this.sm.Query(-1)
+        }
+    }
+    return
+}
+
+func (this *Clerk) refreshConfig() {
+    this.configMu.Lock()
+    defer this.configMu.Unlock()
+
+    this.config = this.sm.Query(-1)
 }
 
 // fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
-func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
-
+func (this *Clerk) Get(key string) (value string) {
+    args := GetArgs {
+        ClerkId         : this.id,
+        ClerkSerial     : atomic.AddUint64(&this.serial, 1),
+        Key             : key,
+    }
 	for {
-		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
-			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply GetReply
-				ok := srv.Call("ShardKV.Get", &args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					return reply.Value
-				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-		// ask controller for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+        servers := this.getServersContainsKey(key)
+        success, data := this.broadcaster.Broadcast(servers, "ShardKV.Get", &args)
+        if (!success) {
+            time.Sleep(raft.HEARTBEAT_TIMEOUT_MS_BASE * time.Millisecond)
+            continue
+        }
+        reply := data.(*GetReply)
+        if (reply.Err == OK) {
+            value = reply.Value
+            break
+        } else if (reply.Err == ErrNoKey) {
+            value = ""
+            break
+        } else if (reply.Err == ErrWrongGroup) {
+            time.Sleep(raft.HEARTBEAT_TIMEOUT_MS_BASE * time.Millisecond)
+            this.refreshConfig()
+            continue
+        } else {
+            fmt.Printf("err %v\n", reply.Err)
+            panic("unexpected reply error\n")
+        }
 	}
-
-	return ""
+    this.debug("GET %v->%v\n", key, value)
+	return
 }
 
 // shared by Put and Append.
 // You will have to modify this function.
-func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-
-
+func (this *Clerk) PutAppend(key string, value string, op string) {
+    args := PutAppendArgs {
+        ClerkId         : this.id,
+        ClerkSerial     : atomic.AddUint64(&this.serial, 1),
+        Key             : key,
+        Value           : value,
+        Op              : op,
+    }
 	for {
-		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply PutAppendReply
-				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				if ok && reply.Err == OK {
-					return
-				}
-				if ok && reply.Err == ErrWrongGroup {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-		// ask controller for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+        servers := this.getServersContainsKey(key)
+        success, data := this.broadcaster.Broadcast(servers, "ShardKV.PutAppend", &args)
+        if (!success) {
+            time.Sleep(raft.HEARTBEAT_TIMEOUT_MS_BASE * time.Millisecond)
+            continue
+        }
+        reply := data.(*PutAppendReply)
+        if (reply.Err == OK) {
+            break
+        } else if (reply.Err == ErrWrongGroup) {
+            time.Sleep(raft.HEARTBEAT_TIMEOUT_MS_BASE * time.Millisecond)
+            this.refreshConfig()
+            continue
+        } else {
+            fmt.Printf("err %v\n", reply.Err)
+            panic("unexpected reply error\n")
+        }
 	}
+    return
 }
 
-func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+func (this *Clerk) Put(key string, value string) {
+    this.PutAppend(key, value, "Put")
+    this.debug("PUT %v->%v\n", key, value)
 }
-func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+
+func (this *Clerk) Append(key string, value string) {
+    this.PutAppend(key, value, "Append")
+    this.debug("APPEND %v->%v\n", key, value)
 }
