@@ -51,8 +51,15 @@ func (this *Broadcaster) sendRequest(server *labrpc.ClientEnd, api string,
     return
 }
 
+/*
+ * fails only when network failures happened or timeout
+ */
 func (this *Broadcaster) Broadcast(servers []*labrpc.ClientEnd, api string,
                                    args interface{}) (success bool, reply interface{}) {
+    if (len(servers) == 0) {
+        fmt.Printf("api: %v, args: %v\n", api, args)
+        panic("incorrect broadcasting without target servers\n")
+    }
     /* broadcast request asynchronizily */
     replyCh := make(chan reflect.Value, 1)
     wg := sync.WaitGroup{}

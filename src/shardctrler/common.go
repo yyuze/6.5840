@@ -1,5 +1,6 @@
 package shardctrler
 
+import "6.5840/labrpc"
 //
 // Shard controller: assigns shards to replication groups.
 //
@@ -45,6 +46,25 @@ func (this *Config) MakeCopy() (c Config) {
     }
     for gid, servers := range(this.Groups) {
         c.Groups[gid] = servers
+    }
+    return
+}
+
+func (this *Config) Init() {
+    this.Num = 0
+    for i := 0; i < NShards; i++ {
+        this.Shards[i] = 0
+    }
+    this.Groups = make(map[int][]string)
+}
+
+func (this *Config) GetServersOf(gid int, make_end func(string) *labrpc.ClientEnd) (servers [](*labrpc.ClientEnd)) {
+    serverNames, contains := this.Groups[gid]
+    servers = [](*labrpc.ClientEnd){}
+    if (contains) {
+        for _, name := range(serverNames) {
+            servers = append(servers, make_end(name))
+        }
     }
     return
 }

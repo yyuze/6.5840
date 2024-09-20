@@ -251,7 +251,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
         fsm         : util.RaftFSM{},
         configs     : make([]Config, 1),
     }
-	sc.configs[0].Groups = map[int][]string{}
+	sc.configs[0].Init()
 
     sc.fsm.Init(me, servers, persister, -1)
     sc.fsm.RegisterHandler(OP_JOIN, false, sc.doJoin)

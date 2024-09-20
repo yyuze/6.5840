@@ -9,12 +9,16 @@ package shardkv
 // You will have to modify these definitions.
 //
 
-const DEBUG = true
+import "6.5840/shardctrler"
+
+const DEBUG = false
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
+	OK                  = "OK"
+	ErrNoKey            = "ErrNoKey"
+	ErrWrongGroup       = "ErrWrongGroup"
+    ErrRetryLock        = "ErrRetryLock"
+    ErrStaledConfig     = "ErrStaledConfig"
 )
 
 type Err string
@@ -23,6 +27,7 @@ type Err string
 type PutAppendArgs struct {
     ClerkId         int64
     ClerkSerial     uint64
+    ConfigNum       int
     Key             string
     Value           string
     Op              string // "Put" or "Append"
@@ -31,11 +36,13 @@ type PutAppendArgs struct {
 type PutAppendReply struct {
     RaftErr         string
 	Err             Err
+    OldValue        string
 }
 
 type GetArgs struct {
     ClerkId         int64
     ClerkSerial     uint64
+    ConfigNum       int
     Key             string
 }
 
@@ -43,4 +50,35 @@ type GetReply struct {
     RaftErr         string
 	Err             Err
 	Value           string
+}
+
+type InstallKVsArgs struct {
+    Config          shardctrler.Config
+    KVs             map[string]Value
+}
+
+type InstallKVsReply struct {
+
+}
+
+type FetchKVsArgs struct {
+    ClerkId         int64
+    ClerkSerial     uint64
+    NewConfig       shardctrler.Config
+    OldConfig       shardctrler.Config
+    Gid             int
+}
+
+type FetchKVsReply struct {
+    RaftErr         string
+    Err             Err
+    KVs             map[string]Value
+}
+
+type NopArgs struct {
+
+}
+
+type NopReply struct {
+
 }

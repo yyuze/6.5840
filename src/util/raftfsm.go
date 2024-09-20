@@ -23,7 +23,12 @@ func (this *RaftFSM) debug(format string, a ...interface{}) {
 }
 
 type OpResult struct {
-    body                interface{}
+    Serial              uint64
+    Body                interface{}
+}
+
+type OpHistory struct {
+    Results             map[uint64]OpResult     /* clerk serial -> OpResult */
 }
 
 type Op struct {
@@ -56,9 +61,9 @@ type RaftHandler struct {
     function            func(raftIndex int, data interface{}) (reply interface{})
 }
 
-type RaftSnapshotSerializer func() (snapshot []byte)
+type RaftSnapshotSerializer func(index int) (snapshot []byte)
 
-type RaftSnapshotDeserializer func(snapshot []byte)
+type RaftSnapshotDeserializer func(index int, snapshot []byte)
 
 type RaftFSM struct {
     me                          int
@@ -71,7 +76,7 @@ type RaftFSM struct {
     handlers                    map[uint32]RaftHandler
     snapshotSerializer          RaftSnapshotSerializer
     snapshotDeserializer        RaftSnapshotDeserializer
-    maxClerkSerial              map[int64]uint64
+    processed                   map[int64]OpHistory
     committing                  map[int](*chan OpResult)
 }
 
@@ -93,7 +98,7 @@ func (this *RaftFSM) Init(me int, servers []*labrpc.ClientEnd, persister *raft.P
     this.handlers = make(map[uint32]RaftHandler)
     this.snapshotSerializer = nil
     this.snapshotDeserializer = nil
-    this.maxClerkSerial = make(map[int64]uint64)
+    this.processed = make(map[int64]OpHistory)
     this.committing = make(map[int](*chan OpResult))
 }
 
@@ -144,7 +149,7 @@ func (this *RaftFSM) Submit(clerkId int64, clerkSerial uint64, opType uint32,
     /* wait result with timeout */
     select {
     case opResult := <- resultCh:
-        result = opResult.body
+        result = opResult.Body
         success = true
     case <-time.After(time.Duration(2 * raft.HEARTBEAT_TICK_MS) * time.Millisecond):
         this.debug("start op timeout, term: %v, index: %v\n", term, index)
@@ -160,27 +165,26 @@ func (this *RaftFSM) Submit(clerkId int64, clerkSerial uint64, opType uint32,
 func (this *RaftFSM) commandHandler(index int, command []byte) {
     op := Op{}
     op.fromBytes(command)
-    this.mu.Lock()
-    /* check whether op is already processed */
-    var processed bool
-    maxSerial, contains := this.maxClerkSerial[op.ClerkId]
-    if (contains && maxSerial >= op.ClerkSerial) {
-        processed = true
-    } else {
-        this.maxClerkSerial[op.ClerkId] = op.ClerkSerial
-        processed = false
-    }
     /* get op handler */
     handler, contains := this.handlers[op.Type]
     if (!contains) {
         fmt.Printf("op.Type: %v\n", op.Type)
         panic("illegal unregister operation type\n")
     }
-    this.mu.Unlock()
-    /* handle op */
-    result := OpResult{}
-    if (!processed || handler.readonly) {
-        result.body = handler.function(index, op.Body)
+    /* check whether op is already processed */
+    history, contains := this.processed[op.ClerkId]
+    if (!contains) {
+        history = OpHistory { Results: make(map[uint64]OpResult) }
+    }
+    prevResult, contains := history.Results[op.ClerkSerial]
+    var result OpResult
+    if (!contains || handler.readonly) {
+        result.Body = handler.function(index, op.Body)
+        result.Serial = op.ClerkSerial
+        history.Results[op.ClerkSerial] = result
+        this.processed[op.ClerkId] = history
+    } else {
+        result = prevResult
     }
     /* waitup waiting thread */
     if (op.StartServer == this.id) {
@@ -196,7 +200,7 @@ func (this *RaftFSM) commandHandler(index int, command []byte) {
 
 type Snapshot struct {
     Data                []byte
-    MaxClerkSerial      map[int64]uint64
+    Processed           map[int64]OpHistory
 }
 
 func (this *RaftFSM) takeSnapshot(index int) {
@@ -207,8 +211,8 @@ func (this *RaftFSM) takeSnapshot(index int) {
         panic("snapshot serializer is not regisered, cannot serialize snapshot\n")
     }
     snapshot := Snapshot {
-        Data            : this.snapshotSerializer(),
-        MaxClerkSerial  : this.maxClerkSerial,
+        Data            : this.snapshotSerializer(index),
+        Processed       : this.processed,
     }
     buf := bytes.Buffer{}
     enc := labgob.NewEncoder(&buf)
@@ -218,7 +222,7 @@ func (this *RaftFSM) takeSnapshot(index int) {
     go this.rf.Snapshot(index, buf.Bytes())
 }
 
-func (this *RaftFSM) applySnapshot(snapshotBytes []byte) {
+func (this *RaftFSM) applySnapshot(snapshotIndex int, snapshotBytes []byte) {
     this.mu.Lock()
     defer this.mu.Unlock()
 
@@ -233,8 +237,8 @@ func (this *RaftFSM) applySnapshot(snapshotBytes []byte) {
         fmt.Printf("%v\n", err)
         panic("decode snapshot failed=n")
     }
-    this.snapshotDeserializer(snapshot.Data)
-    this.maxClerkSerial = snapshot.MaxClerkSerial
+    this.snapshotDeserializer(snapshotIndex, snapshot.Data)
+    this.processed = snapshot.Processed
 }
 
 func (this *RaftFSM) handler() {
@@ -250,7 +254,7 @@ func (this *RaftFSM) handler() {
                 panic("snapshot handler is not registered\n")
             }
             this.debug("handle raft snapthot on term: %v, index: %v\n", msg.SnapshotTerm, msg.SnapshotIndex)
-            this.applySnapshot(msg.Snapshot)
+            this.applySnapshot(msg.SnapshotIndex, msg.Snapshot)
         } else {
             panic("unknonw raft message type\n")
         }

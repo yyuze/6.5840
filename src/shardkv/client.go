@@ -75,6 +75,8 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
         broadcaster     : util.Broadcaster{},
     }
 
+    ck.config = ck.sm.Query(-1)
+
     ck.broadcaster.Init()
     ck.broadcaster.RegisterPair(PutAppendArgs{}, PutAppendReply{})
     ck.broadcaster.RegisterPair(GetArgs{}, GetReply{})
@@ -82,24 +84,20 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	return &ck
 }
 
-func (this *Clerk) getServersContainsKey(key string) (servers [](*labrpc.ClientEnd)) {
+func (this *Clerk) getServersContainsKey(key string) (configNum int, servers [](*labrpc.ClientEnd)) {
     this.configMu.Lock()
     defer this.configMu.Unlock()
 
     for {
         gid := this.config.Shards[key2shard(key)]
-        serverNames, contains := this.config.Groups[gid]
-        if (contains) {
-            servers = [](*labrpc.ClientEnd){}
-            for _, name := range(serverNames) {
-                servers = append(servers, this.make_end(name))
-            }
+        servers = this.config.GetServersOf(gid, this.make_end)
+        if (len(servers) > 0) {
             break
-        } else {
-            time.Sleep(raft.HEARTBEAT_TIMEOUT_MS_BASE * time.Millisecond)
-            this.config = this.sm.Query(-1)
         }
+        time.Sleep(raft.HEARTBEAT_TICK_MS * time.Millisecond)
+        this.config = this.sm.Query(-1)
     }
+    configNum = this.config.Num
     return
 }
 
@@ -121,10 +119,12 @@ func (this *Clerk) Get(key string) (value string) {
         Key             : key,
     }
 	for {
-        servers := this.getServersContainsKey(key)
+        configNum, servers := this.getServersContainsKey(key)
+        args.ConfigNum = configNum
         success, data := this.broadcaster.Broadcast(servers, "ShardKV.Get", &args)
         if (!success) {
-            time.Sleep(raft.HEARTBEAT_TIMEOUT_MS_BASE * time.Millisecond)
+            this.refreshConfig()
+            time.Sleep(raft.HEARTBEAT_TICK_MS * time.Millisecond)
             continue
         }
         reply := data.(*GetReply)
@@ -135,8 +135,11 @@ func (this *Clerk) Get(key string) (value string) {
             value = ""
             break
         } else if (reply.Err == ErrWrongGroup) {
-            time.Sleep(raft.HEARTBEAT_TIMEOUT_MS_BASE * time.Millisecond)
+            time.Sleep(raft.HEARTBEAT_TICK_MS * time.Millisecond)
             this.refreshConfig()
+            continue
+        } else if (reply.Err == ErrRetryLock) {
+            time.Sleep(10 * time.Millisecond) /* todo: should be random */
             continue
         } else {
             fmt.Printf("err %v\n", reply.Err)
@@ -149,7 +152,7 @@ func (this *Clerk) Get(key string) (value string) {
 
 // shared by Put and Append.
 // You will have to modify this function.
-func (this *Clerk) PutAppend(key string, value string, op string) {
+func (this *Clerk) PutAppend(key string, value string, op string) (oldVal string) {
     args := PutAppendArgs {
         ClerkId         : this.id,
         ClerkSerial     : atomic.AddUint64(&this.serial, 1),
@@ -158,18 +161,25 @@ func (this *Clerk) PutAppend(key string, value string, op string) {
         Op              : op,
     }
 	for {
-        servers := this.getServersContainsKey(key)
+        configNum, servers := this.getServersContainsKey(key)
+        args.ConfigNum = configNum
         success, data := this.broadcaster.Broadcast(servers, "ShardKV.PutAppend", &args)
         if (!success) {
-            time.Sleep(raft.HEARTBEAT_TIMEOUT_MS_BASE * time.Millisecond)
+            this.refreshConfig()
+            time.Sleep(raft.HEARTBEAT_TICK_MS * time.Millisecond)
             continue
         }
         reply := data.(*PutAppendReply)
         if (reply.Err == OK) {
+            oldVal = reply.OldValue
             break
-        } else if (reply.Err == ErrWrongGroup) {
-            time.Sleep(raft.HEARTBEAT_TIMEOUT_MS_BASE * time.Millisecond)
+        } else if (reply.Err == ErrRetryLock) {
+            time.Sleep(10 * time.Millisecond) /* todo: should be random */
+            continue
+        } else if (reply.Err == ErrWrongGroup || reply.Err == ErrStaledConfig) {
+            time.Sleep(raft.HEARTBEAT_TICK_MS * time.Millisecond)
             this.refreshConfig()
+            args.ClerkSerial = atomic.AddUint64(&this.serial, 1)
             continue
         } else {
             fmt.Printf("err %v\n", reply.Err)
@@ -179,12 +189,14 @@ func (this *Clerk) PutAppend(key string, value string, op string) {
     return
 }
 
-func (this *Clerk) Put(key string, value string) {
-    this.PutAppend(key, value, "Put")
-    this.debug("PUT %v->%v\n", key, value)
+func (this *Clerk) Put(key string, value string) (oldVal string) {
+    oldVal = this.PutAppend(key, value, "Put")
+    this.debug("PUT %v->%v, old value: %v\n", key, value, oldVal)
+    return
 }
 
-func (this *Clerk) Append(key string, value string) {
-    this.PutAppend(key, value, "Append")
-    this.debug("APPEND %v->%v\n", key, value)
+func (this *Clerk) Append(key string, value string) (oldVal string) {
+    oldVal = this.PutAppend(key, value, "Append")
+    this.debug("APPEND %v->%v, old value: %v\n", key, value, oldVal)
+    return
 }
