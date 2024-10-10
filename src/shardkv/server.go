@@ -39,8 +39,6 @@ type ShardKV struct {
     fsm                 util.RaftFSM
 
     data                map[string]Value                    /* key -> value */
-    locked              bool
-    requestLock         map[int]bool                        /* gid -> requested lock */
 }
 
 type FlushCh struct {
@@ -92,10 +90,9 @@ func (this *ShardKV) isLeader() bool {
     return success
 }
 
-func (this *ShardKV) fetchKeys(newConfig *shardctrler.Config) (kvs map[string]Value) {
+func (this *ShardKV) fetchKeys(newConfig *shardctrler.Config, configs []shardctrler.Config) (kvs map[string]Value) {
     kvs = make(map[string]Value)
-    for configNum := 1; configNum < newConfig.Num && !this.killed(); configNum++ {
-        oldConfig := this.sm.Query(configNum)
+    for _, oldConfig := range(configs) {
         /* fetch kvs from $oldConfig */
         for gid, _ := range(oldConfig.Groups) {
             /* fetch kvs from each shard */
@@ -144,6 +141,14 @@ func (this *ShardKV) installKVs(kvs map[string]Value, newConfig *shardctrler.Con
     return
 }
 
+func (this *ShardKV) fetchConfigs(latest *shardctrler.Config) (configs []shardctrler.Config) {
+    configs = []shardctrler.Config{}
+    for i := 1; i < latest.Num; i++ {
+        configs = append(configs, this.sm.Query(i))
+    }
+    return
+}
+
 func (this *ShardKV) updateConfig() {
     refreshing := uint32(0)
     for !this.killed() {
@@ -153,6 +158,7 @@ func (this *ShardKV) updateConfig() {
         }
         go func() {
             var newConfig   shardctrler.Config
+            var configs     []shardctrler.Config
             var kvs         map[string]Value
 
             if (!atomic.CompareAndSwapUint32(&refreshing, 0, 1)) {
@@ -161,21 +167,27 @@ func (this *ShardKV) updateConfig() {
             if (this.killed()) {
                 goto done_refresh
             }
-            newConfig = this.sm.Query(-1)
-            /* fetch keys belong to this shard from each other groups */
-            kvs = this.fetchKeys(&newConfig)
-            /* check config stalations */
+            /* check config */
             this.rwmu.Lock()
+            newConfig = this.sm.Query(-1)
             if (this.config.Num == newConfig.Num) {
-                goto unlock
+                this.rwmu.Unlock()
+                goto done_refresh
             }
+            this.rwmu.Unlock()
+            /* fetch previous configs */
+            configs = this.fetchConfigs(&newConfig)
+            /* fetch keys belong to this shard from each other groups */
+            kvs = this.fetchKeys(&newConfig, configs)
             /* install fetched kvs to fsm */
+            this.rwmu.Lock()
             if (!this.installKVs(kvs, &newConfig)) {
                 /* fails if &this is not leader */
                 goto unlock
             }
-            this.debug("updated config from %v to %v\n", this.config, newConfig)
             this.config = newConfig
+
+            this.debug("updated config from %v to %v\n", this.config, newConfig)
             /* todo: removed fetched keys here */
         unlock:
             this.rwmu.Unlock()
@@ -259,6 +271,11 @@ func (this *ShardKV) FetchKVs(args *FetchKVsArgs, reply *FetchKVsReply) {
     }
     defer this.rwmu.RUnlock()
 
+    config := this.sm.Query(-1)
+    if (config.Num != this.config.Num) {
+        this.syncConf.noti()
+    }
+
     /* submit raft log */
     success, result := this.fsm.Submit(args.ClerkId, args.ClerkSerial, OP_FETCH_KVS, *args)
     if (success) {
@@ -297,6 +314,7 @@ func (this *ShardKV) doGet(raftIndex int, data interface{}) (reply interface{}) 
         Err         : OK,
         Value       : value.getVal(),
     }
+    this.debug("GET(fsm) %v -> %v\n", args.Key, value.getVal())
     return
 }
 
@@ -314,6 +332,7 @@ func (this *ShardKV) doPutAppend(raftIndex int, data interface{}) (reply interfa
         }
         value.putVal(raftIndex, args.ClerkId, args.ClerkSerial, args.ConfigNum, args.Value)
         this.data[args.Key] = value
+        this.debug("PUT(fsm) %v -> %v, added: %v\n", args.Key, value.getVal(), args.Value)
     case "Append":
         value, contains := this.data[args.Key]
         if (!contains) {
@@ -325,6 +344,7 @@ func (this *ShardKV) doPutAppend(raftIndex int, data interface{}) (reply interfa
         if (value.ConfigNum == args.ConfigNum) {
             value.appendVal(raftIndex, args.ClerkId, args.ClerkSerial, args.ConfigNum, args.Value)
             this.data[args.Key] = value
+            this.debug("APPEND(fsm) %v -> %v, added %v\n", args.Key, value.getVal(), args.Value)
         } else {
             reply = PutAppendReply { Err : ErrStaledConfig }
             return
@@ -346,6 +366,7 @@ func (this *ShardKV) doFetchKVs(raftIndex int, data interface{}) (reply interfac
     for k, v := range(this.data) {
         if (isKeyInGroup(k, args.Gid, &args.NewConfig) && v.ConfigNum == args.OldConfig.Num) {
             kvs[k] = v.makeCopy()
+            this.debug("FETCH(fsm) by group %v, %v -> %v\n", args.Gid, k, v.getVal())
         }
     }
     reply = FetchKVsReply {
@@ -362,6 +383,7 @@ func (this *ShardKV) doInstallKVs(raftIndex int, data interface{}) (reply interf
         val, contains := this.data[k]
         if ((contains && val.ConfigNum < v.ConfigNum) || !contains) {
             this.data[k] = v
+            this.debug("INSTALL(fsm) %v -> %v\n", k, v.getVal())
         }
     }
     /* refresh config number for each key */

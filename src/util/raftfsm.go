@@ -235,7 +235,7 @@ func (this *RaftFSM) applySnapshot(snapshotIndex int, snapshotBytes []byte) {
     err := dec.Decode(&snapshot)
     if (err != nil) {
         fmt.Printf("%v\n", err)
-        panic("decode snapshot failed=n")
+        panic("decode snapshot failed\n")
     }
     this.snapshotDeserializer(snapshotIndex, snapshot.Data)
     this.processed = snapshot.Processed

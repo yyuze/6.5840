@@ -36,7 +36,7 @@ func (this *Config) Equal(config Config) bool {
 }
 
 func (this *Config) MakeCopy() (c Config) {
-    c = Config{
+    c = Config {
         Num         : this.Num,
         Shards      : [NShards]int{},
         Groups      : make(map[int][]string),

@@ -62,6 +62,7 @@ func (this *Value) putVal(raftIndex int, clerkId int64, seq uint64, configNum in
         success = false
         return
     }
+    this.Mutates = make(map[int64]([]Version))
     this.Mutates[clerkId] = []Version {
         Version {
             Timestamp   : time.Now().UnixNano(),
@@ -79,13 +80,12 @@ func (this *Value) putVal(raftIndex int, clerkId int64, seq uint64, configNum in
 func (this *Value) appendVal(raftIndex int, clerkId int64, seq uint64, configNum int, value string) (success bool) {
     old, contains := this.Mutates[clerkId]
     if (!contains) {
-        this.putVal(raftIndex, clerkId, seq, configNum, value)
-        success = true
-        return
-    }
-    if (old[len(old) - 1].Seq >= seq) {
-        success = false
-        return
+        old = []Version{}
+    } else {
+        if (old[len(old) - 1].Seq >= seq) {
+            success = false
+            return
+        }
     }
     this.Mutates[clerkId] = append(old, Version {
         Timestamp   : time.Now().UnixNano(),

@@ -8,6 +8,7 @@ import "6.5840/util"
 import "fmt"
 import "log"
 import "sort"
+import "bytes"
 
 func (this *ShardCtrler) debug(format string, a ...interface{}) {
 	if DEBUG {
@@ -222,6 +223,34 @@ func (this *ShardCtrler) doQuery(raftIndex int, data interface{}) (reply interfa
     return
 }
 
+type Snapshot struct {
+    Configs         []Config
+}
+
+func (this *ShardCtrler) snapshotSerializer(snapshotIndex int) (snapshotBytes []byte) {
+    buf := bytes.Buffer{}
+    enc := labgob.NewEncoder(&buf)
+    snapshot := Snapshot {
+        Configs : this.configs,
+    }
+    enc.Encode(&snapshot)
+    snapshotBytes = buf.Bytes()
+    return
+}
+
+func (this *ShardCtrler) snapshotDeserializer(snapshotIndex int, snapshotBytes []byte) {
+    buf := bytes.NewBuffer(snapshotBytes)
+    dec := labgob.NewDecoder(buf)
+    snapshot := Snapshot{}
+    err := dec.Decode(&snapshot)
+    if (err != nil) {
+        fmt.Printf("error: %v\n", err)
+        panic("decode shardkv snapshot failed\n")
+    }
+    this.configs = snapshot.Configs
+    return
+}
+
 // the tester calls Kill() when a ShardCtrler instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
@@ -242,9 +271,13 @@ func (sc *ShardCtrler) Raft() *raft.Raft {
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardCtrler {
 	labgob.Register(util.Op{})
 	labgob.Register(JoinArgs{})
+	labgob.Register(JoinReply{})
 	labgob.Register(LeaveArgs{})
+	labgob.Register(LeaveReply{})
 	labgob.Register(MoveArgs{})
+	labgob.Register(MoveReply{})
 	labgob.Register(QueryArgs{})
+	labgob.Register(QueryReply{})
 
     sc := ShardCtrler {
         me          : me,
@@ -253,11 +286,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
     }
 	sc.configs[0].Init()
 
+    //sc.fsm.Init(me, servers, persister, 5000)
     sc.fsm.Init(me, servers, persister, -1)
-    sc.fsm.RegisterHandler(OP_JOIN, false, sc.doJoin)
-    sc.fsm.RegisterHandler(OP_LEAVE, false, sc.doLeave)
-    sc.fsm.RegisterHandler(OP_MOVE, false, sc.doMove)
-    sc.fsm.RegisterHandler(OP_QUERY, true, sc.doQuery)
+    sc.fsm.RegisterHandler(OP_JOIN,         false,      sc.doJoin)
+    sc.fsm.RegisterHandler(OP_LEAVE,        false,      sc.doLeave)
+    sc.fsm.RegisterHandler(OP_MOVE,         false,      sc.doMove)
+    sc.fsm.RegisterHandler(OP_QUERY,        true,       sc.doQuery)
+    sc.fsm.RegisterSnapshotHandler(sc.snapshotSerializer, sc.snapshotDeserializer)
     sc.fsm.Start()
 
     sc.rf = sc.fsm.Raft()

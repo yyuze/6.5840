@@ -369,6 +369,11 @@ func (this *Raft) Snapshot(index int, snapshot []byte) {
             compactIndex = idx
         }
     }
+    if (compactIndex == -1) {
+        fmt.Printf("this.snapshotIndex: %v, this.commitIndex: %v, this.log: %v\n",
+                   this.snapshotIndex, this.commitIndex, this.log)
+        panic("unexpected snapshot logs\n")
+    }
     this.snapshot = snapshot
     this.snapshotTerm = this.log[compactIndex].Term
     this.snapshotIndex = this.log[compactIndex].Index
